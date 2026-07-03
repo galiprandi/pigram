@@ -28,6 +28,7 @@ import { DEFAULT_UX, type PigramConfig } from "./config/schema.js";
 import { createHttpTransport, type TelegramTransport, type TelegramUpdate } from "./telegram/transport.js";
 import { TelegramPoller } from "./telegram/poller.js";
 import { DialogManager } from "./telegram/dialog.js";
+import { TypingIndicator } from "./telegram/typing.js";
 import { markdownToTelegramHtml, chunkTelegramHtml } from "./telegram/markdown.js";
 import { decidePairing, applyPairing, type PairingState } from "./domain/pairing.js";
 import {
@@ -87,7 +88,7 @@ export default function pigram(pi: ExtensionAPI): void {
 	// submit call to know when the reply is ready. Instead we track the active
 	// turn here and clear it in the agent_end handler. When stream previews are
 	// enabled the turn also carries a PreviewSession that owns the live bubble.
-	let activeTurn: { chatId: number; preview?: PreviewSession } | undefined;
+	let activeTurn: { chatId: number; preview?: PreviewSession; stopTyping?: () => void } | undefined;
 
 	// The most recent SUCCESSFUL assistant text reply (raw Markdown), kept so
 	// /resend can replay it without a new LLM call. Captured on agent_end,
@@ -281,9 +282,10 @@ export default function pigram(pi: ExtensionAPI): void {
 				// starts clean and no stale reply lands in it.
 				if (activeTurn) {
 					await session.abort();
+					activeTurn.stopTyping?.();
 					activeTurn = undefined;
-				}
-				followUps.clear();
+					}
+					followUps.clear();
 				lastReplyMarkdown = undefined;
 				await performNewSession(chatId, parsed.name);
 				return true;
@@ -364,10 +366,18 @@ export default function pigram(pi: ExtensionAPI): void {
 			streamPreviews && richText && transport
 				? new PreviewSession(chatId, { transport })
 				: undefined;
-		activeTurn = { chatId, ...(preview ? { preview } : {}) };
-		// A typing indicator gives the user liveness feedback while pi works
-		// (and covers the gap before the first streamed token arrives).
-		void transport?.sendChatAction({ chatId, action: "typing" }).catch(() => undefined);
+		// A repeating typing indicator gives the user liveness feedback while
+		// pi works (and covers the gap before the first streamed token arrives).
+		const t = transport; // capture for callback narrowing
+		const typing = t
+			? new TypingIndicator(chatId, {
+					sendChatAction: (o) => t.sendChatAction(o),
+					setInterval: globalThis.setInterval.bind(globalThis),
+					clearInterval: globalThis.clearInterval.bind(globalThis),
+				})
+			: undefined;
+		typing?.start();
+		activeTurn = { chatId, ...(preview ? { preview } : {}), stopTyping: () => typing?.stop() };
 		const mapped = mapInboundMessage(msg);
 		await session.sendPrompt(mapped.text, mapped.imagePaths);
 	}
@@ -694,6 +704,7 @@ export default function pigram(pi: ExtensionAPI): void {
 	pi.on("agent_end", async (event) => {
 		const turn = activeTurn;
 		if (!turn) return;
+		turn.stopTyping?.();
 		activeTurn = undefined;
 
 		const outcome = extractAssistantText(event.messages as AgentMessageLike[]);
