@@ -90,3 +90,39 @@ export function extractAssistantText(messages: readonly AgentMessageLike[]): Ass
 	}
 	return {};
 }
+
+/** The result of resolving an agent_end event for reply storage and delivery. */
+export interface ResolvedReply {
+	/** The assistant text to store for /resend, or undefined if none. */
+	text?: string;
+	/** Whether the reply should be delivered to Telegram (has an active turn). */
+	shouldDeliver: boolean;
+	/** Error detail when the turn failed. */
+	errorMessage?: string;
+}
+
+/**
+ * Decide what to store and whether to deliver after an agent_end event.
+ *
+ * Always extracts the assistant text so /resend can replay it later — even
+ * when the prompt originated from the laptop (no activeTurn). The
+ * `hasActiveTurn` flag only controls whether the caller should deliver the
+ * reply to Telegram.
+ */
+export function resolveReplyToStore(
+	messages: readonly AgentMessageLike[],
+	hasActiveTurn: boolean,
+): ResolvedReply {
+	const outcome = extractAssistantText(messages);
+
+	if (outcome.stopReason === "aborted") {
+		return { shouldDeliver: false };
+	}
+	if (outcome.stopReason === "error") {
+		return { shouldDeliver: hasActiveTurn, ...(outcome.errorMessage ? { errorMessage: outcome.errorMessage } : {}) };
+	}
+	if (outcome.text) {
+		return { text: outcome.text, shouldDeliver: hasActiveTurn };
+	}
+	return { shouldDeliver: false };
+}

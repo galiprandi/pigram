@@ -51,7 +51,7 @@ import {
 import { bindPiSession } from "./pi/session-binding.js";
 import type { ThinkingLevel } from "./pi/session.js";
 import { AttachmentQueue, flushAttachments, buildAttachToolParams, executeAttach } from "./pi/attach.js";
-import { extractAssistantText, getAgentMessageText, type AgentMessageLike } from "./pi/assistant-text.js";
+import { getAgentMessageText, resolveReplyToStore, type AgentMessageLike } from "./pi/assistant-text.js";
 import { PreviewSession } from "./telegram/preview.js";
 
 export const PIGRAM_VERSION = "0.1.0";
@@ -703,25 +703,28 @@ export default function pigram(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async (event) => {
 		const turn = activeTurn;
+
+		// Always resolve the reply so /resend can replay it — even when the
+		// prompt originated from the laptop (no activeTurn).
+		const resolved = resolveReplyToStore(event.messages as AgentMessageLike[], !!turn);
+
+		// Store for /resend regardless of delivery.
+		if (resolved.text) lastReplyMarkdown = resolved.text;
+
+		// No active turn → nothing to deliver (laptop prompt).
 		if (!turn) return;
 		turn.stopTyping?.();
 		activeTurn = undefined;
 
-		const outcome = extractAssistantText(event.messages as AgentMessageLike[]);
-
-		if (outcome.stopReason === "aborted") {
-			// User asked to stop; the /stop ack already covers it.
-		} else if (outcome.stopReason === "error") {
-			await sendPlain(turn.chatId, `⚠️ ${outcome.errorMessage ?? "pi failed while processing the request."}`);
-		} else if (outcome.text) {
-			// Remember this successful reply so /resend can replay it.
-			lastReplyMarkdown = outcome.text;
+		if (resolved.shouldDeliver && resolved.errorMessage) {
+			await sendPlain(turn.chatId, `⚠️ ${resolved.errorMessage ?? "pi failed while processing the request."}`);
+		} else if (resolved.shouldDeliver && resolved.text) {
 			// With a preview, finalize edits the live bubble in place to the rich
 			// reply (no duplicate message). Without one, send the reply directly.
 			if (turn.preview) {
-				await turn.preview.finalize(outcome.text);
+				await turn.preview.finalize(resolved.text);
 			} else {
-				await sendMarkdown(turn.chatId, outcome.text);
+				await sendMarkdown(turn.chatId, resolved.text);
 			}
 		}
 
