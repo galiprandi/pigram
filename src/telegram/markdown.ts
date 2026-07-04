@@ -214,41 +214,57 @@ export function chunkTelegramHtml(html: string, maxLength = 4096): string[] {
 	if (html.length <= maxLength) {
 		return [html];
 	}
-	
+
 	const chunks: string[] = [];
 	const tagStack: Array<{ name: string; fullTag: string }> = [];
 	let currentChunk = '';
 	let i = 0;
-	
-	while (i < html.length) {
-		// Check if we need to split before adding more content
-		// Leave room for closing tags (estimate 50 chars per tag)
-		const closingTagsLength = tagStack.reduce((sum, tag) => sum + tag.name.length + 3, 0); // </name>
-		if (currentChunk.length + closingTagsLength >= maxLength) {
-			// Close all open tags
-			for (let j = tagStack.length - 1; j >= 0; j--) {
-				currentChunk += `</${tagStack[j]!.name}>`;
-			}
-			chunks.push(currentChunk);
-			
-			// Start new chunk by reopening tags
-			currentChunk = tagStack.map(tag => tag.fullTag).join('');
+
+	/** Total length of closing tags needed for the current stack. */
+	const closingLen = () => tagStack.reduce((s, t) => s + t.name.length + 3, 0); // </name>
+
+	/** Close all open tags, push the chunk, reopen tags in a fresh chunk. */
+	const flush = () => {
+		for (let j = tagStack.length - 1; j >= 0; j--) {
+			currentChunk += `</${tagStack[j]!.name}>`;
 		}
-		
-		// Parse next token
+		chunks.push(currentChunk);
+		currentChunk = tagStack.map(t => t.fullTag).join('');
+	};
+
+	while (i < html.length) {
 		if (html[i]! === '<') {
 			// Find end of tag
 			const tagEnd = html.indexOf('>', i);
 			if (tagEnd === -1) break; // Malformed HTML
-			
+
 			const tag = html.slice(i, tagEnd + 1);
-			currentChunk += tag;
-			
-			// Determine tag type
+			const tagLen = tagEnd - i + 1;
+
+			// Calculate how this tag changes the closing-tag budget.
+			// Opening tags ADD to the stack (future closing cost goes up);
+			// closing tags REMOVE from the stack (cost goes down).
+			let closingDelta = 0;
 			if (tag.startsWith('</')) {
-				// Closing tag
+				const name = tag.slice(2, -1).trim();
+				closingDelta = -(name.length + 3); // </name>
+			} else if (!tag.endsWith('/>') && !tag.startsWith('<!')) {
+				const sp = tag.indexOf(' ');
+				const gt = tag.indexOf('>');
+				const name = tag.slice(1, sp > 0 && sp < gt ? sp : gt).trim();
+				closingDelta = name.length + 3;
+			}
+
+			// Check BEFORE adding: would this tag + updated closing tags overflow?
+			if (currentChunk.length > 0 && currentChunk.length + tagLen + closingLen() + closingDelta > maxLength) {
+				flush();
+			}
+
+			currentChunk += tag;
+
+			// Update tagStack
+			if (tag.startsWith('</')) {
 				const tagName = tag.slice(2, -1).trim();
-				// Pop matching opening tag from stack
 				for (let j = tagStack.length - 1; j >= 0; j--) {
 					if (tagStack[j]!.name === tagName) {
 						tagStack.splice(j, 1);
@@ -256,26 +272,64 @@ export function chunkTelegramHtml(html: string, maxLength = 4096): string[] {
 					}
 				}
 			} else if (!tag.endsWith('/>') && !tag.startsWith('<!')) {
-				// Opening tag (not self-closing, not comment)
 				const spaceIndex = tag.indexOf(' ');
 				const closeIndex = tag.indexOf('>');
 				const tagName = tag.slice(1, spaceIndex > 0 && spaceIndex < closeIndex ? spaceIndex : closeIndex).trim();
 				tagStack.push({ name: tagName, fullTag: tag });
 			}
 			// Self-closing or comments are not tracked
-			
+
 			i = tagEnd + 1;
 		} else {
-			// Regular text content
+			// Regular text content — check after adding each character
 			currentChunk += html[i]!;
 			i++;
+
+			if (currentChunk.length + closingLen() >= maxLength) {
+				flush();
+			}
 		}
 	}
-	
+
 	// Add final chunk
 	if (currentChunk.length > 0) {
 		chunks.push(currentChunk);
 	}
-	
+
+	return chunks;
+}
+
+/**
+ * Split plain text into <=maxLength chunks at paragraph boundaries (`\\n\\n`).
+ * Falls back to splitting on single newlines, then character boundaries.
+ * Used for assistant replies sent as plain text (richText disabled).
+ */
+export function chunkPlainText(text: string, maxLength = 4096): string[] {
+	if (text.length <= maxLength) {
+		return [text];
+	}
+
+	const chunks: string[] = [];
+	let remaining = text;
+
+	while (remaining.length > maxLength) {
+		// Try to split at the last paragraph break within maxLength
+		let splitAt = remaining.lastIndexOf('\n\n', maxLength);
+		if (splitAt <= 0) {
+			// No paragraph break — try single newline
+			splitAt = remaining.lastIndexOf('\n', maxLength);
+		}
+		if (splitAt <= 0) {
+			// No newline at all — hard split at maxLength
+			splitAt = maxLength;
+		}
+		chunks.push(remaining.slice(0, splitAt));
+		remaining = remaining.slice(splitAt).replace(/^\n+/, '');
+	}
+
+	if (remaining.length > 0) {
+		chunks.push(remaining);
+	}
+
 	return chunks;
 }

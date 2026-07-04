@@ -29,7 +29,7 @@ import { createHttpTransport, type TelegramTransport, type TelegramUpdate } from
 import { TelegramPoller } from "./telegram/poller.js";
 import { DialogManager } from "./telegram/dialog.js";
 import { TypingIndicator } from "./telegram/typing.js";
-import { markdownToTelegramHtml, chunkTelegramHtml } from "./telegram/markdown.js";
+import { markdownToTelegramHtml, chunkTelegramHtml, chunkPlainText } from "./telegram/markdown.js";
 import { decidePairing, applyPairing, type PairingState } from "./domain/pairing.js";
 import {
 	parseCommand,
@@ -180,7 +180,10 @@ export default function pigram(pi: ExtensionAPI): void {
 		if (!transport) return;
 		const richText = config?.ux?.richText ?? DEFAULT_UX.richText;
 		if (!richText) {
-			await sendPlain(chatId, markdown);
+			// Chunk long plain-text messages at paragraph boundaries.
+			for (const chunk of chunkPlainText(markdown)) {
+				await sendPlain(chatId, chunk);
+			}
 			return;
 		}
 		await sendHtml(chatId, markdownToTelegramHtml(markdown));
