@@ -123,7 +123,57 @@ function renderList(token: any, parser: any, depth: number): string {
  * Convert markdown to Telegram-supported HTML subset.
  * Supported tags: <b> <i> <u> <s> <a> <code> <pre> <blockquote> <tg-spoiler>
  */
+/**
+ * Strip raw HTML tags that the LLM emits instead of markdown syntax.
+ *
+ * LLMs sometimes produce `<br>`, `<b>text</b>`, `<code>x</code>` etc. instead
+ * of markdown equivalents. Without this step, `marked` treats them as raw HTML
+ * tokens, the `html()` renderer escapes them to entities (`&lt;br&gt;`), and
+ * Telegram shows literal tag text.
+ *
+ * Strategy: stash fenced code blocks and inline code first (their contents must
+ * not be touched), convert supported inline tags to markdown equivalents, strip
+ * unsupported tags (keeping their text content), then restore the stashed code.
+ */
+function sanitizeRawHtml(markdown: string): string {
+	const stashed: string[] = [];
+	const stash = (s: string) => {
+		stashed.push(s);
+		return `\u0000${stashed.length - 1}\u0000`;
+	};
+
+	// 1. Stash fenced code blocks — their content must stay verbatim.
+	let text = markdown.replace(/```[^\n]*\n?([\s\S]*?)```/g, (m) => stash(m));
+
+	// 2. Stash inline code — backtick content must stay verbatim.
+	text = text.replace(/`([^`]+)`/g, (m) => stash(m));
+
+	// 3. <br> variants → newline (Telegram has no <br>).
+	text = text.replace(/<br\s*\/?>/gi, "\n");
+
+	// 4. </br> → remove (invalid void-element closing tag).
+	text = text.replace(/<\/br>/gi, "");
+
+	// 5. Convert supported inline HTML tags to markdown equivalents.
+	//    Process inner tags first (<code> before <b>) so nesting works.
+	text = text.replace(/<code>([\s\S]*?)<\/code>/gi, (_, inner) => `\`${inner}\``);
+	text = text.replace(/<strong>([\s\S]*?)<\/strong>/gi, (_, inner) => `**${inner}**`);
+	text = text.replace(/<b>([\s\S]*?)<\/b>/gi, (_, inner) => `**${inner}**`);
+	text = text.replace(/<em>([\s\S]*?)<\/em>/gi, (_, inner) => `*${inner}*`);
+	text = text.replace(/<i>([\s\S]*?)<\/i>/gi, (_, inner) => `*${inner}*`);
+
+	// 6. Strip unsupported tags (keep text content). Covers <div>, <span>,
+	//    <p>, <ul>, <ol>, <li>, <table>, etc. — anything Telegram won't render.
+	text = text.replace(/<\/?[a-zA-Z][^>]*>/g, "");
+
+	// 7. Restore stashed code.
+	text = text.replace(/\u0000(\d+)\u0000/g, (_, i: string) => stashed[Number(i)]!);
+
+	return text;
+}
+
 export function markdownToTelegramHtml(markdown: string): string {
+	const sanitized = sanitizeRawHtml(markdown);
 	const renderer = {
 		text(this: any, token: { text: string; tokens?: any[] }): string {
 			// Block-level text tokens carry inline children (bold, code, etc.).
@@ -200,7 +250,7 @@ export function markdownToTelegramHtml(markdown: string): string {
 	};
 	
 	marked.use({ renderer });
-	const html = marked.parse(markdown) as string;
+	const html = marked.parse(sanitized) as string;
 	
 	// Collapse the extra blank lines introduced by block separators and trim edges
 	return html.replace(/\n{3,}/g, "\n\n").trim();

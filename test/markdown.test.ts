@@ -123,6 +123,78 @@ describe("chunkTelegramHtml", () => {
 	});
 });
 
+describe("markdownToTelegramHtml — raw HTML sanitization", () => {
+	// The LLM sometimes outputs raw HTML tags (<br>, <b>, <code>) instead of
+	// markdown syntax. Telegram either strips unsupported tags (<br>) or, when
+	// the renderer escapes them to entities, shows literal tag text. These tests
+	// pin the sanitization that converts raw HTML to markdown BEFORE marked sees it.
+
+	test("converts <br> tags to newlines", () => {
+		expect(markdownToTelegramHtml("line 1<br>line 2")).toBe("line 1\nline 2");
+		expect(markdownToTelegramHtml("line 1<br/>line 2")).toBe("line 1\nline 2");
+		expect(markdownToTelegramHtml("line 1<br />line 2")).toBe("line 1\nline 2");
+	});
+
+	test("removes </br> (invalid void-element closing tag)", () => {
+		expect(markdownToTelegramHtml("text</br>more")).toBe("textmore");
+	});
+
+	test("converts <b>bold</b> to markdown bold → Telegram <b>", () => {
+		expect(markdownToTelegramHtml("<b>important</b>")).toBe("<b>important</b>");
+	});
+
+	test("converts <strong> to markdown bold", () => {
+		expect(markdownToTelegramHtml("<strong>important</strong>")).toBe("<b>important</b>");
+	});
+
+	test("converts <i>text</i> to markdown italic → Telegram <i>", () => {
+		expect(markdownToTelegramHtml("<i>emphasis</i>")).toBe("<i>emphasis</i>");
+	});
+
+	test("converts <code>text</code> to backtick code → Telegram <code>", () => {
+		expect(markdownToTelegramHtml("<code>GET /api</code>")).toBe("<code>GET /api</code>");
+	});
+
+	test("converts nested raw HTML: <b><code>text</code></b>", () => {
+		// <b> wrapping <code> — both should be converted to markdown.
+		// Markdown bold with inline code inside: **`text**` won't work right,
+		// so the order matters: convert <code> first (inner), then <b> (outer).
+		const result = markdownToTelegramHtml("<b><code>/api/v1/gaji</code></b>");
+		expect(result).toContain("<code>/api/v1/gaji</code>");
+		expect(result).not.toContain("&lt;");
+	});
+
+	test("converts <br> between list items with raw HTML", () => {
+		const md = "• <b>Referensi (4)</b><br><code>GET /change-categories</code>";
+		const result = markdownToTelegramHtml(md);
+		expect(result).toContain("<b>Referensi (4)</b>");
+		expect(result).toContain("<code>GET /change-categories</code>");
+		expect(result).not.toContain("&lt;br&gt;");
+		expect(result).not.toContain("&lt;b&gt;");
+		expect(result).not.toContain("&lt;code&gt;");
+	});
+
+	test("does not touch HTML inside fenced code blocks", () => {
+		const md = "```\n<b>not html</b>\n<br>\n```";
+		const result = markdownToTelegramHtml(md);
+		// Inside <pre>, content is escaped — the tags stay as literal text
+		expect(result).toContain("&lt;b&gt;");
+		expect(result).toContain("&lt;br&gt;");
+	});
+
+	test("does not touch HTML inside inline code", () => {
+		const result = markdownToTelegramHtml("`<br>` is a line break");
+		expect(result).toContain("<code>&lt;br&gt;</code>");
+	});
+
+	test("strips unsupported tags like <div>, <span>, <p>", () => {
+		const result = markdownToTelegramHtml("<div>content</div>");
+		expect(result).toBe("content");
+		expect(result).not.toContain("<div>");
+		expect(result).not.toContain("&lt;div&gt;");
+	});
+});
+
 describe("chunkPlainText", () => {
 	test("returns single chunk when text fits", () => {
 		expect(chunkPlainText("short text")).toEqual(["short text"]);
