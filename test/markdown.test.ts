@@ -123,6 +123,27 @@ describe("chunkTelegramHtml", () => {
 	});
 });
 
+describe("markdownToTelegramHtml — hard line breaks", () => {
+	// Markdown's two-trailing-spaces + newline produces a <br> in most parsers.
+	// Telegram does NOT support <br> — it either rejects the message (400) or
+	// strips the tag silently, causing lines to run together. The renderer must
+	// emit a newline instead.
+	test("converts markdown hard line break (two trailing spaces) to newline", () => {
+		const md = "first line  \nsecond line";
+		const html = markdownToTelegramHtml(md);
+		expect(html).not.toContain("<br>");
+		expect(html).toContain("first line\nsecond line");
+	});
+
+	test("converts hard line break inside a paragraph with bold", () => {
+		const md = "**bold text**  \nplain continuation";
+		const html = markdownToTelegramHtml(md);
+		expect(html).not.toContain("<br>");
+		expect(html).toContain("<b>bold text</b>");
+		expect(html).toContain("plain continuation");
+	});
+});
+
 describe("markdownToTelegramHtml — raw HTML sanitization", () => {
 	// The LLM sometimes outputs raw HTML tags (<br>, <b>, <code>) instead of
 	// markdown syntax. Telegram either strips unsupported tags (<br>) or, when

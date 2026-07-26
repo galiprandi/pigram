@@ -209,6 +209,9 @@ export function markdownToTelegramHtml(markdown: string): string {
 		hr(): string {
 			return "──────────\n\n";
 		},
+		br(): string {
+			return "\n";
+		},
 		list(this: any, token: { ordered: boolean; items: any[] }): string {
 			return renderList(token, this.parser, 0) + '\n\n';
 		},
