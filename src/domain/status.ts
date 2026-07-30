@@ -52,6 +52,8 @@ export interface SessionStatusView {
 	rootDirectory?: string;
 	mode: "project" | "global";
 	configPath: string;
+	lockHolderPid?: number;
+	lockHolderSince?: string | undefined;
 }
 
 /** Escape text destined for a Telegram HTML message. */
@@ -94,7 +96,7 @@ export function formatSessionStatus(view: SessionStatusView): string {
 		`- Session Name: ${escapeHtml(view.sessionName ?? "unnamed")}`,
 		formatContextLine(view.context),
 		`- Usage: ↑${formatTokens(view.usage?.input ?? 0)} | ↓${formatTokens(view.usage?.output ?? 0)}`,
-		`- Status: ${view.busy ? "Busy" : "Idle"}`,
+		`- Status: ${view.busy ? "Busy" : "Idle"}${view.lockHolderPid !== undefined ? ` (locked by PID ${view.lockHolderPid})` : ""}`,
 		`- Queued: ${view.queued}`,
 		`- Root Directory: ${view.rootDirectory ? code(view.rootDirectory) : "unknown"}`,
 		"",
