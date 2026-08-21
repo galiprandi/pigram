@@ -135,6 +135,7 @@ describe("migrateLegacyConfig", () => {
         ux: {
           richText: false,
           streamPreviews: false,
+          richTables: true, // defaulted
         },
       });
     });
@@ -234,6 +235,7 @@ describe("migrateLegacyConfig", () => {
       expect(config?.ux).toEqual({
         richText: true,
         streamPreviews: true,
+        richTables: true,
       });
     });
 

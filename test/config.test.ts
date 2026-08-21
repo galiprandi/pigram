@@ -12,6 +12,7 @@ describe("PigramConfig validation", () => {
       expect(result.config.ux).toEqual({
         richText: true,
         streamPreviews: true,
+        richTables: true,
       });
     }
   });
@@ -29,6 +30,7 @@ describe("PigramConfig validation", () => {
       expect(result.config.ux).toEqual({
         richText: false,
         streamPreviews: false,
+        richTables: true, // defaulted
       });
     }
   });
@@ -106,6 +108,7 @@ describe("PigramConfig validation", () => {
       expect(result.config.ux).toEqual({
         richText: false,
         streamPreviews: true, // defaulted
+        richTables: true, // defaulted
       });
     }
   });

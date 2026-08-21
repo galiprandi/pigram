@@ -72,6 +72,23 @@ function padCell(cell: string, target: number): string {
 	return pad > 0 ? cell + " ".repeat(pad) : cell;
 }
 
+// Extract the inline content of a blockquote: its .tokens hold BLOCK-level
+// tokens (paragraph, nested blockquote, code), and parseInline throws on
+// those ("Token with 'paragraph' type was not found"). Recurse through the
+// wrappers and parseInline only the inline leaves. Multi-line results are
+// re-indented under the list marker by renderList's continuation regex.
+function renderQuoteContent(token: any, parser: any): string {
+	return (token.tokens ?? [])
+		.map((t: any) => {
+			if (t.type === "blockquote") return renderQuoteContent(t, parser);
+			if (t.type === "space") return "";
+			if (t.tokens) return parser.parseInline(t.tokens);
+			return typeof t.text === "string" ? escapeTelegramHtml(t.text) : "";
+		})
+		.filter((s: string) => s.length > 0)
+		.join("\n");
+}
+
 // Telegram HTML has no <ul>/<ol>; lists are rendered as indented plain-text
 // lines. A list item can hold BLOCK children (a nested list, a second
 // paragraph), so we cannot just parseInline its tokens — that throws
@@ -99,6 +116,9 @@ function renderList(token: any, parser: any, depth: number): string {
 		for (const child of item.tokens ?? []) {
 			if (child.type === "list") {
 				nestedBlocks.push(renderList(child, parser, depth + 1));
+			} else if (child.type === "blockquote") {
+				// Blockquote children hold BLOCK tokens; parseInline would throw.
+				nestedBlocks.push(renderQuoteContent(child, parser));
 			} else if (child.type === "space") {
 				// blank line between loose-list paragraphs — skip
 			} else if (child.tokens) {

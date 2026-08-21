@@ -150,6 +150,18 @@ export interface TelegramTransport {
 	}): Promise<void>;
 
 	/**
+	 * Send a Bot API 10.1 rich message from raw markdown.
+	 * Telegram renders GFM pipe tables as native bordered tables.
+	 * Throws on any API error; callers classify via isPermanentRichError.
+	 */
+	sendRichMessage(opts: { chatId: number; markdown: string }): Promise<{ message_id: number }>;
+
+	/**
+	 * Edit an existing message into a Bot API 10.1 rich message.
+	 */
+	editMessageRich(opts: { chatId: number; messageId: number; markdown: string }): Promise<void>;
+
+	/**
 	 * Send a chat action (typing indicator, upload indicator, etc).
 	 */
 	sendChatAction(opts: {
@@ -296,6 +308,21 @@ export function createHttpTransport(opts: {
 			if (opts.replyMarkup !== undefined) body.reply_markup = opts.replyMarkup;
 
 			await callTelegram<true>("editMessageText", body);
+		},
+
+		async sendRichMessage(opts) {
+			return callTelegram<{ message_id: number }>("sendRichMessage", {
+				chat_id: opts.chatId,
+				rich_message: { markdown: opts.markdown },
+			});
+		},
+
+		async editMessageRich(opts) {
+			await callTelegram<true>("editMessageText", {
+				chat_id: opts.chatId,
+				message_id: opts.messageId,
+				rich_message: { markdown: opts.markdown },
+			});
 		},
 
 		async sendChatAction(opts) {

@@ -6,6 +6,9 @@ export const UxPreferencesSchema = Type.Object(
   {
     richText: Type.Optional(Type.Boolean()),
     streamPreviews: Type.Optional(Type.Boolean()),
+    // Bot API 10.1 rich messages: render GFM tables natively (scrollable).
+    // Falls back to the classic <pre> grid when unsupported.
+    richTables: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false }
 );
@@ -16,6 +19,7 @@ export type UxPreferences = Static<typeof UxPreferencesSchema>;
 export const DEFAULT_UX: UxPreferences = {
   richText: true,
   streamPreviews: true,
+  richTables: true,
 };
 
 // Config is the user-edited settings: bot token and UX preferences

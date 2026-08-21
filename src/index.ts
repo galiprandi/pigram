@@ -9,8 +9,9 @@
  * loses only the wiring, not any logic".
  */
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -23,6 +24,11 @@ import {
 	type ResolvedPaths,
 	type Scope,
 } from "./config/store.js";
+import {
+	tryAcquireLock,
+	releaseLock,
+	startHeartbeat,
+} from "./config/lock.js";
 import { migrateLegacyConfig } from "./config/migrate.js";
 import { DEFAULT_UX, type PigramConfig } from "./config/schema.js";
 import { createHttpTransport, type TelegramTransport, type TelegramUpdate } from "./telegram/transport.js";
@@ -98,6 +104,11 @@ export default function pigram(pi: ExtensionAPI): void {
 
 	const followUps = new FollowUpQueue();
 	const attachments = new AttachmentQueue();
+
+	// --- Lock state ---
+	let stopHeartbeat: (() => void) | undefined;
+	let lockHolderPid: number | undefined;
+	let lockHolderSince: string | undefined;
 	// The plain event context, refreshed on every event/command. Safe for status,
 	// model, abort, compact — but NOT session replacement.
 	let latestCtx: ExtensionContext | undefined;
@@ -232,6 +243,10 @@ export default function pigram(pi: ExtensionAPI): void {
 					mode: paths.scope,
 					configPath: paths.configPath,
 				};
+				if (lockHolderPid !== undefined) {
+					view.lockHolderPid = lockHolderPid;
+					view.lockHolderSince = lockHolderSince;
+				}
 				if (s.provider) view.provider = s.provider;
 				if (s.modelId) view.model = s.modelId;
 				if (s.sessionName) view.sessionName = s.sessionName;
@@ -367,7 +382,11 @@ export default function pigram(pi: ExtensionAPI): void {
 		// rich HTML on the same message.
 		const preview =
 			streamPreviews && richText && transport
-				? new PreviewSession(chatId, { transport })
+				? new PreviewSession(chatId, {
+						transport,
+						// Rich tables off → the session never attempts the rich path.
+						richTables: config?.ux?.richTables ?? DEFAULT_UX.richTables,
+					})
 				: undefined;
 		// A repeating typing indicator gives the user liveness feedback while
 		// pi works (and covers the gap before the first streamed token arrives).
@@ -401,6 +420,27 @@ export default function pigram(pi: ExtensionAPI): void {
 	// --- Polling lifecycle ---
 	async function startPolling(): Promise<void> {
 		if (!config?.botToken || pollingActive) return;
+
+		// Try to acquire the poller lock to prevent multiple instances
+		// from polling the same bot token simultaneously.
+		if (paths) {
+			const lockPath = join(paths.tempDir, "lock.json");
+			const tokenHash = createHash("sha256").update(config.botToken).digest("hex");
+			const lockResult = await tryAcquireLock(lockPath, tokenHash);
+			if (!lockResult.acquired) {
+				lockHolderPid = lockResult.holderPid;
+				lockHolderSince = lockResult.holderSince;
+				latestCtx?.ui.setStatus(
+					"pigram",
+					`held by PID ${lockResult.holderPid} (since ${lockResult.holderSince})`,
+				);
+				return;
+			}
+			lockHolderPid = undefined;
+			lockHolderSince = undefined;
+			stopHeartbeat = startHeartbeat(lockPath);
+		}
+
 		transport = createHttpTransport({ botToken: config.botToken });
 		const me = await transport.getMe();
 		if (paths) {
@@ -449,6 +489,13 @@ export default function pigram(pi: ExtensionAPI): void {
 	}
 
 	function stopPolling(): void {
+		stopHeartbeat?.();
+		stopHeartbeat = undefined;
+		// Best-effort lock release; stale recovery handles crash cases.
+		if (paths) {
+			const lockPath = join(paths.tempDir, "lock.json");
+			void releaseLock(lockPath);
+		}
 		abortController?.abort();
 		abortController = undefined;
 		pollingActive = false;
@@ -608,7 +655,13 @@ export default function pigram(pi: ExtensionAPI): void {
 				`config: ${paths?.configPath ?? "not loaded"}`,
 				`scope: ${paths?.scope ?? "n/a"}`,
 				`paired user: ${pairing.pairedUserId ?? "not paired"}`,
-				`polling: ${pollingActive ? "running" : "stopped"}`,
+				`polling: ${
+					pollingActive
+						? "running"
+						: lockHolderPid !== undefined
+							? `blocked (PID ${lockHolderPid} holds this bot)`
+							: "stopped"
+				}`,
 			];
 			ctx.ui.notify(lines.join(" | "), "info");
 		},
