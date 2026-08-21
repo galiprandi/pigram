@@ -100,6 +100,17 @@ These run inside pi (not Telegram) to control the bridge:
 | `/pigram-connect [local\|global]` | Start the bridge using an existing config |
 | `/pigram-disconnect` | Stop the bridge for this session |
 | `/pigram-status` | Show config path, scope, paired user, and polling state |
+| `/pigram-notify [on\|off]` | Deliver the next reply (or all replies with `on`) to Telegram |
+
+### Working from the laptop
+
+Prompt pi in the terminal as usual, then run `/pigram-notify` (a pi command,
+not a Telegram one) before or while the turn runs. When the turn completes,
+the reply is delivered to your Telegram chat even though the prompt never came
+from Telegram — no need to chat first. Without an argument it arms for the
+next completed turn only; `/pigram-notify on` keeps delivering every reply
+until `/pigram-notify off`. The target chat is the last active chat, falling
+back to the paired user's DM. State resets with the session (`/new`, exit).
 
 ---
 
