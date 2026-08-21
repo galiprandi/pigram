@@ -56,6 +56,32 @@ describe("markdownToTelegramHtml — lists", () => {
 		const html = markdownToTelegramHtml(md);
 		expect(html).toBe("• L0\n  • L1\n    1. L2a\n    2. L2b");
 	});
+
+	// Regression: a blockquote inside a list item used to crash the converter
+	// with "Token with 'paragraph' type was not found" — renderList handed the
+	// quote's BLOCK-level tokens to parseInline, which only accepts inline
+	// tokens. The whole reply was lost (finalize() has no try/catch around the
+	// conversion).
+	test("renders a blockquote inside a list item without crashing", () => {
+		const html = markdownToTelegramHtml("- item\n  > quoted text");
+		expect(html).toBe("• item\nquoted text");
+	});
+
+	test("renders a blockquote inside an ordered list item", () => {
+		const html = markdownToTelegramHtml("1. first\n   > quote here\n2. second");
+		expect(html).toBe("1. first\nquote here\n2. second");
+	});
+
+	test("preserves inline emphasis inside a quoted list item", () => {
+		const html = markdownToTelegramHtml("- item\n  > **bold** quote");
+		expect(html).toBe("• item\n<b>bold</b> quote");
+	});
+
+	test("renders a nested blockquote inside a list item", () => {
+		const html = markdownToTelegramHtml("- item\n  > outer\n  >> inner");
+		expect(html).toContain("outer");
+		expect(html).toContain("inner");
+	});
 });
 
 describe("chunkTelegramHtml", () => {
