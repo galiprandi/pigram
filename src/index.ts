@@ -46,6 +46,7 @@ import {
 import { mapInboundMessage, FollowUpQueue, type InboundMessage } from "./domain/prompt.js";
 import { getGitExecSpec, runGitSpec, type GitRunResult } from "./domain/git.js";
 import { formatSessionStatus, formatFooterStatus, type SessionStatusView } from "./domain/status.js";
+import { parseNotifyArgs, consumePendingNotify, type PendingNotify } from "./domain/notify.js";
 import {
 	findPendingReconnectRequest,
 	formatNewSessionConfirmation,
@@ -101,6 +102,14 @@ export default function pigram(pi: ExtensionAPI): void {
 	// cleared whenever the session is reset (/new) or torn down so /resend
 	// never replays a reply that belongs to a previous session.
 	let lastReplyMarkdown: string | undefined;
+
+	// An armed /pigram-notify request. When set, the NEXT completed agent
+	// turn's reply is delivered to Telegram even when the prompt was typed in
+	// the laptop terminal (no activeTurn). "once" mode disarms after one
+	// delivery; "sticky" mode keeps delivering until turned off or the session
+	// resets. Cleared at every session-reset boundary alongside
+	// lastReplyMarkdown (see /new and session_shutdown).
+	let pendingNotify: PendingNotify | undefined;
 
 	const followUps = new FollowUpQueue();
 	const attachments = new AttachmentQueue();
@@ -305,6 +314,7 @@ export default function pigram(pi: ExtensionAPI): void {
 					}
 					followUps.clear();
 				lastReplyMarkdown = undefined;
+				pendingNotify = undefined;
 				await performNewSession(chatId, parsed.name);
 				return true;
 			}
@@ -655,6 +665,13 @@ export default function pigram(pi: ExtensionAPI): void {
 				`config: ${paths?.configPath ?? "not loaded"}`,
 				`scope: ${paths?.scope ?? "n/a"}`,
 				`paired user: ${pairing.pairedUserId ?? "not paired"}`,
+				`notify: ${
+					pendingNotify === undefined
+						? "off"
+						: pendingNotify.mode === "once"
+							? "armed (next reply → Telegram)"
+							: "on (sticky)"
+				}`,
 				`polling: ${
 					pollingActive
 						? "running"
@@ -664,6 +681,41 @@ export default function pigram(pi: ExtensionAPI): void {
 				}`,
 			];
 			ctx.ui.notify(lines.join(" | "), "info");
+		},
+	});
+
+	// --- Register the notify command (laptop → Telegram delivery) ---
+	pi.registerCommand("pigram-notify", {
+		description:
+			"Deliver the next agent turn's reply to Telegram (use when working from the laptop)",
+		handler: async (args, ctx) => {
+			latestCtx = ctx;
+			latestCommandCtx = ctx;
+			const parsed = parseNotifyArgs(args);
+			if (!parsed.ok) {
+				ctx.ui.notify(parsed.message, "warning");
+				return;
+			}
+			if (parsed.mode === "off") {
+				pendingNotify = undefined;
+				ctx.ui.notify("Pigram notify: off", "info");
+				return;
+			}
+			const chatId = activeChatId ?? pairing.pairedUserId ?? undefined;
+			if (chatId === undefined) {
+				ctx.ui.notify(
+					"No Telegram chat known yet. Pair first: send /start to your bot in Telegram once.",
+					"warning",
+				);
+				return;
+			}
+			pendingNotify = { mode: parsed.mode, chatId };
+			ctx.ui.notify(
+				parsed.mode === "once"
+					? "Pigram notify armed: next reply will be sent to Telegram."
+					: "Pigram notify ON: replies are delivered to Telegram until /pigram-notify off.",
+				"info",
+			);
 		},
 	});
 
@@ -738,6 +790,7 @@ export default function pigram(pi: ExtensionAPI): void {
 		activeTurn = undefined;
 		followUps.clear();
 		lastReplyMarkdown = undefined;
+		pendingNotify = undefined;
 	});
 
 	// --- Assistant reply forwarding ---
@@ -766,6 +819,27 @@ export default function pigram(pi: ExtensionAPI): void {
 
 		// Store for /resend regardless of delivery.
 		if (resolved.text) lastReplyMarkdown = resolved.text;
+
+		// An armed /pigram-notify request consumes every completed turn. When
+		// the prompt came from Telegram the reply is delivered by the normal
+		// path below (and a "once" request counts as satisfied); delivering
+		// here only makes sense for laptop prompts without an active turn.
+		const consumed = consumePendingNotify(
+			pendingNotify,
+			// exactOptionalPropertyTypes: only include fields that are defined.
+			{
+				...(resolved.text ? { text: resolved.text } : {}),
+				...(resolved.errorMessage ? { errorMessage: resolved.errorMessage } : {}),
+			},
+		);
+		pendingNotify = consumed.pending;
+		if (!turn && consumed.deliver) {
+			if (consumed.deliver.kind === "text") {
+				await sendMarkdown(consumed.deliver.chatId, consumed.deliver.markdown);
+			} else {
+				await sendPlain(consumed.deliver.chatId, consumed.deliver.line);
+			}
+		}
 
 		// No active turn → nothing to deliver (laptop prompt).
 		if (!turn) return;
