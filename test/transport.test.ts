@@ -173,6 +173,47 @@ describe("TelegramTransport", () => {
 		expect(call.url).toBe(`https://api.telegram.org/bot${TOKEN}/editMessageText`);
 	});
 
+	test("sendRichMessage posts raw markdown in rich_message", async () => {
+		const fake = new FakeFetch();
+		fake.queueResponse({ ok: true, result: { message_id: 777 } });
+
+		const transport = createHttpTransport({ botToken: TOKEN, fetchImpl: fake.fetch });
+		const result = await transport.sendRichMessage({
+			chatId: 444,
+			markdown: "| A | B |\n|---|---|\n| 1 | 2 |",
+		});
+
+		expect(result.message_id).toBe(777);
+		const body = await fake.lastBodyAsJson();
+		expect(body).toEqual({
+			chat_id: 444,
+			rich_message: { markdown: "| A | B |\n|---|---|\n| 1 | 2 |" },
+		});
+		const call = fake.lastCall();
+		expect(call.url).toBe(`https://api.telegram.org/bot${TOKEN}/sendRichMessage`);
+	});
+
+	test("editMessageRich edits via editMessageText with rich_message", async () => {
+		const fake = new FakeFetch();
+		fake.queueResponse({ ok: true, result: true });
+
+		const transport = createHttpTransport({ botToken: TOKEN, fetchImpl: fake.fetch });
+		await transport.editMessageRich({
+			chatId: 444,
+			messageId: 555,
+			markdown: "| A |\n|---|\n| 1 |",
+		});
+
+		const body = await fake.lastBodyAsJson();
+		expect(body).toEqual({
+			chat_id: 444,
+			message_id: 555,
+			rich_message: { markdown: "| A |\n|---|\n| 1 |" },
+		});
+		const call = fake.lastCall();
+		expect(call.url).toBe(`https://api.telegram.org/bot${TOKEN}/editMessageText`);
+	});
+
 	test("sendChatAction posts action with snake_case", async () => {
 		const fake = new FakeFetch();
 		fake.queueResponse({ ok: true, result: true });

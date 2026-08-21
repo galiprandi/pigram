@@ -19,16 +19,23 @@
  * are off the bridge sends the final reply directly and never builds one.
  */
 import { markdownToTelegramHtml, chunkTelegramHtml } from "./markdown.js";
+import { containsGfmTable, isPermanentRichError } from "./rich.js";
 import { stripReasoningTags } from "../pi/assistant-text.js";
 
 const DEFAULT_THROTTLE_MS = 750;
 /** Cap streamed previews under Telegram's 4096 hard limit, leaving room for "…". */
 const PREVIEW_MAX = 4000;
 
-/** The Telegram operations a preview needs. parseMode is omitted for plain text. */
+/**
+ * The Telegram operations a preview needs. parseMode is omitted for plain text.
+ * The rich* methods are optional so existing fakes/tests keep working without
+ * them — when absent, finalize simply never attempts the rich path.
+ */
 export interface PreviewTransport {
 	sendMessage(opts: { chatId: number; text: string; parseMode?: "HTML" }): Promise<{ message_id: number }>;
 	editMessageText(opts: { chatId: number; messageId: number; text: string; parseMode?: "HTML" }): Promise<void>;
+	sendRichMessage?(opts: { chatId: number; markdown: string }): Promise<{ message_id: number }>;
+	editMessageRich?(opts: { chatId: number; messageId: number; markdown: string }): Promise<void>;
 }
 
 /**
@@ -64,6 +71,11 @@ export interface PreviewSessionDeps {
 	now?: () => number;
 	/** Trailing timer, injectable for tests. Default setTimeout-backed. */
 	timer?: PreviewTimer;
+	/**
+	 * Attempt Bot API 10.1 rich delivery for replies containing GFM tables
+	 * (native bordered tables). Default true; failures fall back to HTML.
+	 */
+	richTables?: boolean | undefined;
 }
 
 /** Trim and truncate preview text to a safe single-message length. */
@@ -87,6 +99,7 @@ export class PreviewSession {
 	private readonly throttleMs: number;
 	private readonly now: () => number;
 	private readonly timer: PreviewTimer;
+	private readonly richTables: boolean;
 
 	private messageId: number | undefined;
 	private pending: string | undefined;
@@ -95,6 +108,9 @@ export class PreviewSession {
 	// the clock's starting value (Date.now in prod, 0 in tests).
 	private lastFlushAt = Number.NEGATIVE_INFINITY;
 	private finalized = false;
+	// Latched after the first permanent rich failure (method not deployed,
+	// content rejected): every later finalize goes straight to the HTML path.
+	private richDisabled = false;
 
 	constructor(chatId: number, deps: PreviewSessionDeps) {
 		this.chatId = chatId;
@@ -102,6 +118,7 @@ export class PreviewSession {
 		this.throttleMs = deps.throttleMs ?? DEFAULT_THROTTLE_MS;
 		this.now = deps.now ?? Date.now;
 		this.timer = deps.timer ?? realTimer();
+		this.richTables = deps.richTables ?? true;
 	}
 
 	/**
@@ -145,11 +162,20 @@ export class PreviewSession {
 
 	/**
 	 * Replace the streamed preview with the final, richly formatted reply.
-	 * Converts Markdown to Telegram HTML and chunks it. When a preview message
-	 * exists, the first chunk edits it in place (no duplicate bubble); any
-	 * overflow chunks are sent as new messages. With no preview message (no
-	 * tokens streamed) all chunks are sent fresh. Falls back to plain text if
-	 * Telegram rejects the HTML.
+	 *
+	 * When the reply contains a GFM table and the transport supports Bot API
+	 * 10.1 rich messages, the whole reply is first attempted as ONE rich send:
+	 * Telegram renders the table natively (bordered, horizontally scrollable).
+	 * A permanent rich failure latches rich off for the session and falls back
+	 * to the classic HTML path below. Transient failures also fall back here —
+	 * without a legacy resend, since the message may have reached Telegram.
+	 *
+	 * Without tables (or with rich unavailable) the markdown is converted to
+	 * Telegram HTML and chunked. When a preview message exists, the first
+	 * chunk edits it in place (no duplicate bubble); any overflow chunks are
+	 * sent as new messages. With no preview message (no tokens streamed) all
+	 * chunks are sent fresh. Falls back to plain text if Telegram rejects
+	 * the HTML.
 	 */
 	async finalize(markdown: string): Promise<void> {
 		this.finalized = true;
@@ -157,6 +183,11 @@ export class PreviewSession {
 
 		const stripped = stripReasoningTags(markdown);
 		if (!stripped) return; // nothing to show (e.g. a pure tool turn)
+
+		if (this.richTables && !this.richDisabled && containsGfmTable(stripped)) {
+			const delivered = await this.tryRichFinalize(stripped);
+			if (delivered) return;
+		}
 
 		const chunks = chunkTelegramHtml(markdownToTelegramHtml(stripped));
 		if (chunks.length === 0) return;
@@ -170,6 +201,29 @@ export class PreviewSession {
 			for (const chunk of chunks) {
 				await this.sendRich(chunk);
 			}
+		}
+	}
+
+	/**
+	 * One-shot attempt to deliver the reply as a single Bot API 10.1 rich
+	 * message. Returns true when delivered; false when the caller must fall
+	 * back to the HTML path. A permanent error latches rich off for the rest
+	 * of the session so later table replies skip the failed attempt entirely.
+	 */
+	private async tryRichFinalize(markdown: string): Promise<boolean> {
+		try {
+			if (this.messageId !== undefined && this.transport.editMessageRich) {
+				await this.transport.editMessageRich({ chatId: this.chatId, messageId: this.messageId, markdown });
+				return true;
+			}
+			if (this.transport.sendRichMessage) {
+				await this.transport.sendRichMessage({ chatId: this.chatId, markdown });
+				return true;
+			}
+			return false; // transport has no rich support at all
+		} catch (error) {
+			if (isPermanentRichError(error)) this.richDisabled = true;
+			return false;
 		}
 	}
 

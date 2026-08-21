@@ -382,7 +382,11 @@ export default function pigram(pi: ExtensionAPI): void {
 		// rich HTML on the same message.
 		const preview =
 			streamPreviews && richText && transport
-				? new PreviewSession(chatId, { transport })
+				? new PreviewSession(chatId, {
+						transport,
+						// Rich tables off → the session never attempts the rich path.
+						richTables: config?.ux?.richTables ?? DEFAULT_UX.richTables,
+					})
 				: undefined;
 		// A repeating typing indicator gives the user liveness feedback while
 		// pi works (and covers the gap before the first streamed token arrives).
