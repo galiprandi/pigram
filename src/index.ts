@@ -431,10 +431,17 @@ export default function pigram(pi: ExtensionAPI): void {
 	async function startPolling(): Promise<void> {
 		if (!config?.botToken || pollingActive) return;
 
+		// Probe Telegram BEFORE taking the lock or building any runtime
+		// state: a bad token must not leave a held lock + beating heartbeat
+		// behind (that phantom holder blocks every later startPolling).
+		const transportProbe = createHttpTransport({ botToken: config.botToken });
+		const me = await transportProbe.getMe();
+
 		// Try to acquire the poller lock to prevent multiple instances
 		// from polling the same bot token simultaneously.
+		let lockPath: string | undefined;
 		if (paths) {
-			const lockPath = join(paths.tempDir, "lock.json");
+			lockPath = join(paths.tempDir, "lock.json");
 			const tokenHash = createHash("sha256").update(config.botToken).digest("hex");
 			const lockResult = await tryAcquireLock(lockPath, tokenHash);
 			if (!lockResult.acquired) {
@@ -451,51 +458,58 @@ export default function pigram(pi: ExtensionAPI): void {
 			stopHeartbeat = startHeartbeat(lockPath);
 		}
 
-		transport = createHttpTransport({ botToken: config.botToken });
-		const me = await transport.getMe();
-		if (paths) {
-			const state = await readState(paths);
-			state.botId = me.id;
-			if (me.username) state.botUsername = me.username;
-			cursorCache = state.lastUpdateId;
-			await writeState(paths, state);
-		}
-		abortController = new AbortController();
-		const myController = abortController;
-		pollingActive = true;
-		// Surface a persistent footer line so the user can see at a glance that
-		// Telegram is connected, which scope is active, and which config loaded.
-		if (paths) {
-			latestCtx?.ui.setStatus(
-				"pigram",
-				formatFooterStatus({
-					...(me.username ? { botUsername: me.username } : {}),
-					mode: paths.scope,
-					configPath: paths.configPath,
-				}),
-			);
-		}
-		const poller = new TelegramPoller({
-			transport,
-			handler: onUpdate,
-			getCursor,
-			setCursor: persistCursor,
-			pollTimeoutSeconds: POLL_TIMEOUT_SECONDS,
-			errorDelayMs: POLL_ERROR_BACKOFF_MS,
-			conflictDelayMs: POLL_CONFLICT_BACKOFF_MS,
-			onError: (err) => {
-				latestCtx?.ui.setStatus("pigram", `error: ${err instanceof Error ? err.message : String(err)}`);
-			},
-		});
-		void poller.start(myController.signal).finally(() => {
-			// Only clear the flag if WE are still the active poller. After a
-			// /new, a replacement poller may already own pollingActive; an old
-			// poller's late completion must not clear it and invite a second
-			// concurrent poller (which would 409 against the live one).
-			if (abortController === myController) {
-				pollingActive = false;
+		try {
+			transport = createHttpTransport({ botToken: config.botToken });
+			if (paths && lockPath) {
+				const state = await readState(paths);
+				state.botId = me.id;
+				if (me.username) state.botUsername = me.username;
+				cursorCache = state.lastUpdateId;
+				await writeState(paths, state);
 			}
-		});
+			abortController = new AbortController();
+			const myController = abortController;
+			pollingActive = true;
+			// Surface a persistent footer line so the user can see at a glance that
+			// Telegram is connected, which scope is active, and which config loaded.
+			if (paths) {
+				latestCtx?.ui.setStatus(
+					"pigram",
+					formatFooterStatus({
+						...(me.username ? { botUsername: me.username } : {}),
+						mode: paths.scope,
+						configPath: paths.configPath,
+					}),
+				);
+			}
+			const poller = new TelegramPoller({
+				transport,
+				handler: onUpdate,
+				getCursor,
+				setCursor: persistCursor,
+				pollTimeoutSeconds: POLL_TIMEOUT_SECONDS,
+				errorDelayMs: POLL_ERROR_BACKOFF_MS,
+				conflictDelayMs: POLL_CONFLICT_BACKOFF_MS,
+				onError: (err) => {
+					latestCtx?.ui.setStatus("pigram", `error: ${err instanceof Error ? err.message : String(err)}`);
+				},
+			});
+			void poller.start(myController.signal).finally(() => {
+				// Only clear the flag if WE are still the active poller. After a
+				// /new, a replacement poller may already own pollingActive; an old
+				// poller's late completion must not clear it and invite a second
+				// concurrent poller (which would 409 against the live one).
+				if (abortController === myController) {
+					pollingActive = false;
+				}
+			});
+		} catch (err) {
+			// Anything failing after we hold the lock must roll the lock and
+			// heartbeat back, or this process stays a phantom lock holder:
+			// alive, heartbeating, polling nothing — and blocking every retry.
+			stopPolling();
+			throw err;
+		}
 	}
 
 	function stopPolling(): void {

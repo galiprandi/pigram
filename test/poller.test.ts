@@ -338,6 +338,100 @@ describe("TelegramPoller", () => {
 		expect(handler).toHaveBeenCalledWith({ update_id: 100 });
 	});
 
+	test("a network error whose message merely contains 'aborted' does NOT stop the loop", async () => {
+		// Regression (silent poller death, path A): isAbortError used to match
+		// ANY error whose message contains "aborted". Undici/socket failures on
+		// a long-poll can surface with that word without our signal being the
+		// cause, so the loop returned and the bridge went silent while the
+		// lock heartbeat kept beating. Only a set signal may end the loop.
+		let callCount = 0;
+		const transport = {
+			getUpdates: mock(async (_opts: unknown, signal?: AbortSignal) => {
+				await yield_tick();
+				callCount++;
+				if (callCount === 1) {
+					const err = new Error("other side closed / aborted unexpectedly");
+					err.name = "TypeError";
+					throw err;
+				}
+				if (callCount === 2) {
+					return [{ update_id: 100 }] as TelegramUpdate[];
+				}
+				return [];
+			}),
+		};
+
+		let cursor = 99;
+		const handler: UpdateHandler = mock(async () => {});
+		const onError = mock(() => {});
+		const controller = new AbortController();
+		const poller = new TelegramPoller({
+			transport,
+			handler,
+			getCursor: () => cursor,
+			setCursor: mock(async (updateId: number) => {
+				cursor = updateId;
+			}),
+			onError,
+			errorDelayMs: 0,
+		});
+
+		setTimeout(() => controller.abort(), 150);
+		await poller.start(controller.signal);
+
+		expect(onError).toHaveBeenCalled(); // first failure surfaced, loop survived
+		expect(handler).toHaveBeenCalledTimes(1); // update 100 still delivered
+	});
+
+	test("a throwing onError handler does NOT kill the loop", async () => {
+		// Regression (silent poller death, path B): the composition root wires
+		// onError to ctx.ui.setStatus, which can throw on a stale context.
+		// onError ran inside the catch block, so its exception escaped the
+		// while-loop and polling died permanently with no signal at all —
+		// exactly the frozen-cursor + live-heartbeat production signature.
+		let callCount = 0;
+		const transport = {
+			getUpdates: mock(async (_opts: unknown, signal?: AbortSignal) => {
+				await yield_tick();
+				callCount++;
+				if (signal?.aborted) {
+					const err = new Error("The operation was aborted");
+					err.name = "AbortError";
+					throw err;
+				}
+				if (callCount === 1) {
+					throw new Error("Network failure");
+				}
+				if (callCount === 2) {
+					return [{ update_id: 100 }] as TelegramUpdate[];
+				}
+				return [];
+			}),
+		};
+
+		let cursor = 99;
+		const handler: UpdateHandler = mock(async () => {});
+		const controller = new AbortController();
+		const poller = new TelegramPoller({
+			transport,
+			handler,
+			getCursor: () => cursor,
+			setCursor: mock(async (updateId: number) => {
+				cursor = updateId;
+			}),
+			onError: () => {
+				throw new Error("ctx.ui.setStatus exploded on stale context");
+			},
+			errorDelayMs: 0,
+		});
+
+		setTimeout(() => controller.abort(), 150);
+		// Before the fix this promise REJECTED out of start() and update 100
+		// was never fetched; after the fix the loop survives both failures.
+		await expect(poller.start(controller.signal)).resolves.toBeUndefined();
+		expect(handler).toHaveBeenCalledTimes(1);
+	});
+
 	test("409 conflict uses the longer conflict backoff, not the error delay", async () => {
 		let callCount = 0;
 		const callTimes: number[] = [];
