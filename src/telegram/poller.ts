@@ -120,14 +120,23 @@ export class TelegramPoller {
 					await this.handler(update);
 				}
 			} catch (err) {
-				// If the error is due to abort, exit cleanly
-				if (this.isAbortError(err)) {
+				// Exit only when OUR signal is set. Never classify by message
+				// content: undici/socket failures on a long-poll can mention
+				// "aborted" without our signal being the cause, and treating
+				// those as aborts killed the loop silently (bridge goes quiet
+				// while the lock heartbeat keeps beating).
+				if (signal.aborted) {
 					return;
 				}
 
-				// For other errors, call the error handler and continue
+				// Report via onError, but never let reporting itself take the
+				// loop down (e.g. ctx.ui.setStatus throwing on a stale context).
 				if (this.onError) {
-					this.onError(err);
+					try {
+						this.onError(err);
+					} catch {
+						// Swallow: the loop must survive its own error reporter.
+					}
 				}
 
 				// A 409 conflict means another poller holds this bot's getUpdates
@@ -140,16 +149,6 @@ export class TelegramPoller {
 				}
 			}
 		}
-	}
-
-	/**
-	 * Check if an error is an AbortError.
-	 */
-	private isAbortError(err: unknown): boolean {
-		return (
-			err instanceof Error &&
-			(err.name === "AbortError" || err.message.includes("aborted"))
-		);
 	}
 
 	/**
