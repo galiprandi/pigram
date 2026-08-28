@@ -18,6 +18,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AgentSessionPort, SessionStatus, ThinkingLevel } from "./session.js";
 import { sumAssistantUsage } from "./session.js";
 import { resolveModelTarget } from "../domain/model.js";
+import { log } from "../log.js";
 
 /**
  * Returns the latest pi event context, if any. Pi hands a context to every
@@ -126,12 +127,29 @@ export function bindPiSession(pi: ExtensionAPI, getCtx: CommandContextGetter): A
 		},
 
 		async sendPrompt(text: string, imagePaths?: string[]): Promise<void> {
+			// ALWAYS pass deliverAs: "followUp" and AWAIT the call.
+			//
+			// Two bugs were here before:
+			// 1. pi.sendUserMessage was called without await — if it threw
+			//    (e.g. "Agent is already processing"), the error became an
+			//    unhandled rejection and the message was silently lost.
+			// 2. No deliverAs was passed — pi's prompt() throws when streaming
+			//    and no streamingBehavior is specified. This happened when a
+			//    follow-up was drained from pigram's queue in agent_end but pi
+			//    hadn't fully transitioned out of isStreaming yet (race).
+			//
+			// With deliverAs: "followUp", pi queues the message natively if it
+			// is still streaming, and processes it immediately if idle. Either
+			// way, sendUserMessage resolves successfully.
+			const deliverAs = "followUp";
 			if (imagePaths && imagePaths.length > 0) {
 				const images = await Promise.all(imagePaths.map(toImageContent));
 				const content: (TextContent | ImageContent)[] = [{ type: "text", text }, ...images];
-				pi.sendUserMessage(content);
+				log.info("sendPrompt", { hasImages: true, deliverAs });
+				await pi.sendUserMessage(content, { deliverAs });
 			} else {
-				pi.sendUserMessage(text);
+				log.info("sendPrompt", { hasImages: false, deliverAs });
+				await pi.sendUserMessage(text, { deliverAs });
 			}
 		},
 	};

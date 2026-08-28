@@ -388,15 +388,18 @@ export default function pigram(pi: ExtensionAPI): void {
 
 		// Otherwise forward to pi as a prompt (queue if a turn is in flight).
 		if (activeTurn) {
+			log.info("routeMessage.enqueue", { chatId, queueSize: followUps.size + 1, text: msg.text?.slice(0, 60) });
 			followUps.enqueue(msg);
 			return;
 		}
+		log.info("routeMessage.deliver", { chatId, text: msg.text?.slice(0, 60) });
 		await deliverPrompt(chatId, msg);
 	}
 
 	async function deliverPrompt(chatId: number, msg: InboundMessage): Promise<void> {
 		// Mark the turn in flight BEFORE submitting. pi.sendUserMessage returns
 		// immediately; the reply arrives later via message_update / agent_end.
+		log.info("deliverPrompt", { chatId, text: msg.text?.slice(0, 60) });
 		const streamPreviews = config?.ux?.streamPreviews ?? DEFAULT_UX.streamPreviews;
 		const richText = config?.ux?.richText ?? DEFAULT_UX.richText;
 		// Previews only make sense when both rich text and previews are on and we
@@ -923,7 +926,15 @@ export default function pigram(pi: ExtensionAPI): void {
 
 		// Drain one queued follow-up, if any, starting a fresh turn.
 		const next = followUps.dequeue();
-		if (next) await deliverPrompt(turn.chatId, next);
+		if (next) {
+			log.info("agent_end.drainFollowUp", { chatId: turn.chatId, remaining: followUps.size });
+			try {
+				await deliverPrompt(turn.chatId, next);
+			} catch (err) {
+				log.error("agent_end.drainFailed", { error: err instanceof Error ? err.message : String(err) });
+				await sendPlain(turn.chatId, `⚠️ Failed to deliver queued message: ${err instanceof Error ? err.message : String(err)}`).catch(() => undefined);
+			}
+		}
 	});
 }
 
