@@ -1,5 +1,6 @@
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { TelegramRateLimitError } from "./errors.js";
 
 /**
  * Minimal Telegram user shape.
@@ -229,6 +230,22 @@ export function createHttpTransport(opts: {
 		}
 
 		const response = await fetchImpl(`https://api.telegram.org/bot${botToken}/${method}`, fetchOptions);
+
+		// Detect 429 rate-limit BEFORE parsing the body: Telegram returns
+		// retry_after (seconds) in the response envelope. Throwing a typed
+		// error lets the poller honor the wait instead of hammering.
+		if (response.status === 429) {
+			let retryAfter = 1;
+			try {
+				const data = (await response.json()) as TelegramApiResponse<unknown> & { parameters?: { retry_after?: number } };
+				if (data.parameters?.retry_after !== undefined) {
+					retryAfter = data.parameters.retry_after;
+				}
+			} catch {
+				// Body unparseable — default to 1s.
+			}
+			throw new TelegramRateLimitError(retryAfter);
+		}
 
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {

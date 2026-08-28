@@ -60,6 +60,7 @@ import type { ThinkingLevel } from "./pi/session.js";
 import { AttachmentQueue, flushAttachments, buildAttachToolParams, executeAttach } from "./pi/attach.js";
 import { getAgentMessageText, resolveReplyToStore, type AgentMessageLike } from "./pi/assistant-text.js";
 import { PreviewSession } from "./telegram/preview.js";
+import { log } from "./log.js";
 
 export const PIGRAM_VERSION = "0.1.0";
 
@@ -68,6 +69,11 @@ const POLL_TIMEOUT_SECONDS = 30;
 // A 409 getUpdates conflict (another poller is winding down, e.g. after /new)
 // needs a longer pause so the competing consumer can terminate Telegram-side.
 const POLL_CONFLICT_BACKOFF_MS = 3000;
+// Cap for exponential backoff on repeated non-conflict errors. At 60s the
+// poller retries once a minute during a sustained outage — often enough to
+// recover quickly when Telegram comes back, rare enough to never aggravate
+// rate-limiting.
+const POLL_MAX_BACKOFF_MS = 60_000;
 
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -88,6 +94,12 @@ export default function pigram(pi: ExtensionAPI): void {
 	let dialog: DialogManager | undefined;
 	let abortController: AbortController | undefined;
 	let pollingActive = false;
+	// The in-flight poller.start() promise. Tracked so stopPolling() can AWAIT
+	// the old poller winding down before a new one starts — the root cause of
+	// the "silent disconnect": abort() is async, the old getUpdates can still
+	// be holding Telegram's slot when the new poller starts, both 409, and the
+	// bridge goes quiet. Awaiting the promise guarantees clean teardown.
+	let pollingPromise: Promise<void> | undefined;
 	let activeChatId: number | undefined;
 	// A Telegram-originated turn is "in flight" from the moment we submit the
 	// prompt to pi until pi fires `agent_end`. pi.sendUserMessage only SUBMITS;
@@ -429,7 +441,19 @@ export default function pigram(pi: ExtensionAPI): void {
 
 	// --- Polling lifecycle ---
 	async function startPolling(): Promise<void> {
-		if (!config?.botToken || pollingActive) return;
+		if (!config?.botToken) return;
+
+		// If a poller is already active, force a clean restart instead of
+		// silently no-op'ing. The old poller may be stuck (flag says active
+		// but the loop died). Stopping first guarantees a fresh poller.
+		if (pollingActive || pollingPromise) {
+			log.info("startPolling.forceRestart", { pollingActive });
+			stopPolling();
+			await pollingPromise?.catch(() => undefined);
+			pollingPromise = undefined;
+		}
+
+		log.info("startPolling", { scope: paths?.scope });
 
 		// Probe Telegram BEFORE taking the lock or building any runtime
 		// state: a bad token must not leave a held lock + beating heartbeat
@@ -447,6 +471,7 @@ export default function pigram(pi: ExtensionAPI): void {
 			if (!lockResult.acquired) {
 				lockHolderPid = lockResult.holderPid;
 				lockHolderSince = lockResult.holderSince;
+				log.warn("startPolling.lockHeld", { pid: lockResult.holderPid });
 				latestCtx?.ui.setStatus(
 					"pigram",
 					`held by PID ${lockResult.holderPid} (since ${lockResult.holderSince})`,
@@ -490,11 +515,12 @@ export default function pigram(pi: ExtensionAPI): void {
 				pollTimeoutSeconds: POLL_TIMEOUT_SECONDS,
 				errorDelayMs: POLL_ERROR_BACKOFF_MS,
 				conflictDelayMs: POLL_CONFLICT_BACKOFF_MS,
+				maxErrorBackoffMs: POLL_MAX_BACKOFF_MS,
 				onError: (err) => {
 					latestCtx?.ui.setStatus("pigram", `error: ${err instanceof Error ? err.message : String(err)}`);
 				},
 			});
-			void poller.start(myController.signal).finally(() => {
+			pollingPromise = poller.start(myController.signal).finally(() => {
 				// Only clear the flag if WE are still the active poller. After a
 				// /new, a replacement poller may already own pollingActive; an old
 				// poller's late completion must not clear it and invite a second
@@ -502,17 +528,29 @@ export default function pigram(pi: ExtensionAPI): void {
 				if (abortController === myController) {
 					pollingActive = false;
 				}
+				log.info("poller.loopEnded", { wasOurs: abortController === myController });
 			});
 		} catch (err) {
 			// Anything failing after we hold the lock must roll the lock and
 			// heartbeat back, or this process stays a phantom lock holder:
 			// alive, heartbeating, polling nothing — and blocking every retry.
-			stopPolling();
+			log.error("startPolling.failed", { error: err instanceof Error ? err.message : String(err) });
+			await stopPolling();
 			throw err;
 		}
 	}
 
-	function stopPolling(): void {
+	/**
+	 * Stop polling: abort the controller, release the lock, clear the footer.
+	 *
+	 * Returns a promise that resolves when the old poller loop has actually
+	 * exited. Callers that intend to start a new poller immediately after
+	 * MUST await this — otherwise the old getUpdates can still be holding
+	 * Telegram's slot when the new poller starts, causing 409 conflicts and
+	 * a silent bridge.
+	 */
+	function stopPolling(): Promise<void> {
+		log.info("stopPolling", { pollingActive });
 		stopHeartbeat?.();
 		stopHeartbeat = undefined;
 		// Best-effort lock release; stale recovery handles crash cases.
@@ -525,6 +563,12 @@ export default function pigram(pi: ExtensionAPI): void {
 		pollingActive = false;
 		// Clear the connected footer line; the bridge is no longer polling.
 		latestCtx?.ui.setStatus("pigram", undefined);
+		// Await the poller's exit so the Telegram getUpdates slot is freed
+		// before any new poller tries to claim it. The sleep is interruptible
+		// so this resolves within milliseconds of the abort.
+		const p = pollingPromise?.catch(() => undefined);
+		pollingPromise = undefined;
+		return p ?? Promise.resolve();
 	}
 
 	/**
@@ -665,7 +709,7 @@ export default function pigram(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			latestCtx = ctx;
 			latestCommandCtx = ctx;
-			stopPolling();
+			await stopPolling();
 			ctx.ui.notify("Pigram bridge disconnected", "info");
 		},
 	});
@@ -795,11 +839,11 @@ export default function pigram(pi: ExtensionAPI): void {
 	// When pi replaces the session (/new, resume, fork) or shuts down, it tears
 	// down this extension runtime's session binding. Stop our poller so the old
 	// long-poll releases Telegram's getUpdates slot before the replacement
-	// session's session_start fires and starts a new one. stopPolling() flips
-	// pollingActive synchronously, so the subsequent startPolling() is free to
-	// run; any brief overlap surfaces as a 409 the poller now backs off from.
+	// session's session_start fires and starts a new one. We AWAIT stopPolling
+	// so the old getUpdates is truly gone before the new session's poller
+	// starts — this is the fix for the 409 ping-pong that silenced the bridge.
 	pi.on("session_shutdown", async () => {
-		stopPolling();
+		await stopPolling();
 		// Abandon any in-flight turn state from the old session.
 		activeTurn = undefined;
 		followUps.clear();

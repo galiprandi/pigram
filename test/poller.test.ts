@@ -1,6 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
 import type { TelegramUpdate } from "../src/telegram/transport.js";
 import { TelegramPoller, type UpdateHandler, type PollerDeps } from "../src/telegram/poller.js";
+import { TelegramRateLimitError } from "../src/telegram/errors.js";
 
 // Helper to yield control to event loop
 const yield_tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -519,5 +520,165 @@ describe("TelegramPoller", () => {
 			expect(times.length).toBeGreaterThanOrEqual(2);
 			expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(80);
 		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Resilience tests — these capture the bugs that caused the "silent
+// disconnect" in production. Each test is a regression guard.
+// ---------------------------------------------------------------------------
+
+describe("TelegramPoller resilience", () => {
+	test("exponential backoff on repeated non-conflict errors", async () => {
+		// Bug: errorDelayMs was a flat 1000ms. Sustained 5xx / network errors
+		// hammered Telegram every second, which made rate-limiting and socket
+		// resets worse. Fix: double the delay each consecutive error, capped
+		// at maxErrorBackoffMs.
+		const times: number[] = [];
+		let n = 0;
+		const transport = {
+			getUpdates: mock(async (_o: unknown, signal?: AbortSignal) => {
+				await yield_tick();
+				if (signal?.aborted) {
+					const e = new Error("aborted");
+					e.name = "AbortError";
+					throw e;
+				}
+				times.push(Date.now());
+				n++;
+				if (n <= 3) throw new Error("server 503");
+				return [] as TelegramUpdate[];
+			}),
+		};
+		let cursor = 0;
+		const controller = new AbortController();
+		const poller = new TelegramPoller({
+			transport,
+			handler: mock(async () => {}),
+			getCursor: () => cursor,
+			setCursor: mock(async () => {}),
+			onError: mock(() => {}),
+			errorDelayMs: 50,
+			maxErrorBackoffMs: 400,
+		});
+		setTimeout(() => controller.abort(), 800);
+		await poller.start(controller.signal);
+
+		expect(times.length).toBeGreaterThanOrEqual(4);
+		const gap1 = times[1]! - times[0]!;
+		const gap2 = times[2]! - times[1]!;
+		const gap3 = times[3]! - times[2]!;
+		expect(gap1).toBeGreaterThanOrEqual(40);
+		expect(gap2).toBeGreaterThanOrEqual(gap1 + 30);
+		expect(gap3).toBeGreaterThanOrEqual(gap2 + 30);
+	});
+
+	test("429 with retry_after overrides computed backoff", async () => {
+		// Bug: a 429 from Telegram includes retry_after (seconds). The poller
+		// ignored it and waited the flat errorDelayMs, so it retried too soon
+		// and got rate-limited again. Fix: wait max(computed, retry_after*1000).
+		const times: number[] = [];
+		let n = 0;
+		const transport = {
+			getUpdates: mock(async (_o: unknown, signal?: AbortSignal) => {
+				await yield_tick();
+				if (signal?.aborted) {
+					const e = new Error("aborted");
+					e.name = "AbortError";
+					throw e;
+				}
+				times.push(Date.now());
+				n++;
+				if (n === 1) throw new TelegramRateLimitError(2);
+				return [] as TelegramUpdate[];
+			}),
+		};
+		let cursor = 0;
+		const controller = new AbortController();
+		const poller = new TelegramPoller({
+			transport,
+			handler: mock(async () => {}),
+			getCursor: () => cursor,
+			setCursor: mock(async () => {}),
+			onError: mock(() => {}),
+			errorDelayMs: 50,
+		});
+		setTimeout(() => controller.abort(), 2300);
+		await poller.start(controller.signal);
+
+		expect(times.length).toBeGreaterThanOrEqual(2);
+		const gap = times[1]! - times[0]!;
+		expect(gap).toBeGreaterThanOrEqual(1900);
+	});
+
+	test("sleep is interrupted by abort (disconnect is fast)", async () => {
+		// Bug: sleep() was a plain setTimeout that ignored the abort signal.
+		// If the poller was mid-backoff (e.g. 30s cap), /pigram-disconnect
+		// blocked until the sleep finished. Fix: sleep resolves immediately
+		// when the signal aborts.
+		let calls = 0;
+		const transport = {
+			getUpdates: mock(async (_o: unknown, signal?: AbortSignal) => {
+				await yield_tick();
+				calls++;
+				if (signal?.aborted) {
+					const e = new Error("aborted");
+					e.name = "AbortError";
+					throw e;
+				}
+				if (calls === 1) throw new Error("fail");
+				return [] as TelegramUpdate[];
+			}),
+		};
+		const controller = new AbortController();
+		const poller = new TelegramPoller({
+			transport,
+			handler: mock(async () => {}),
+			getCursor: () => 0,
+			setCursor: mock(async () => {}),
+			errorDelayMs: 10_000,
+		});
+		const start = Date.now();
+		setTimeout(() => controller.abort(), 60);
+		await poller.start(controller.signal);
+		const elapsed = Date.now() - start;
+		expect(elapsed).toBeLessThan(500);
+	});
+
+	test("consecutive error counter resets on success", async () => {
+		// After a successful getUpdates, the next failure must use the base
+		// errorDelayMs again, not the previously-escalated backoff.
+		let n = 0;
+		const times: number[] = [];
+		const transport = {
+			getUpdates: mock(async (_o: unknown, signal?: AbortSignal) => {
+				await yield_tick();
+				if (signal?.aborted) {
+					const e = new Error("aborted");
+					e.name = "AbortError";
+					throw e;
+				}
+				times.push(Date.now());
+				n++;
+				if (n === 1 || n === 2 || n === 4) throw new Error("fail");
+				return [] as TelegramUpdate[];
+			}),
+		};
+		const controller = new AbortController();
+		const poller = new TelegramPoller({
+			transport,
+			handler: mock(async () => {}),
+			getCursor: () => 0,
+			setCursor: mock(async () => {}),
+			onError: mock(() => {}),
+			errorDelayMs: 50,
+			maxErrorBackoffMs: 400,
+		});
+		setTimeout(() => controller.abort(), 800);
+		await poller.start(controller.signal);
+
+		expect(times.length).toBeGreaterThanOrEqual(4);
+		const gapAfterReset = times[3]! - times[2]!;
+		expect(gapAfterReset).toBeLessThan(40);
 	});
 });

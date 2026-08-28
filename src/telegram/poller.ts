@@ -1,4 +1,6 @@
 import type { TelegramTransport, TelegramUpdate } from "./transport.js";
+import { getRetryAfterSeconds } from "./errors.js";
+import { log } from "../log.js";
 
 /**
  * Handler for a single Telegram update.
@@ -44,6 +46,11 @@ export interface PollerDeps {
 	/**
 	 * Delay in milliseconds after a non-abort error before retrying.
 	 * Defaults to 0 (useful for fast tests).
+	 *
+	 * When > 0, repeated consecutive errors use exponential backoff:
+	 * errorDelayMs, 2×, 4×, ... up to maxErrorBackoffMs. The counter resets
+	 * on the first successful getUpdates. A 429 with retry_after overrides
+	 * the computed delay with max(computed, retry_after*1000).
 	 */
 	errorDelayMs?: number;
 
@@ -56,6 +63,12 @@ export interface PollerDeps {
 	 * instead of two pollers ping-ponging 409s at each other. Defaults to 3000.
 	 */
 	conflictDelayMs?: number;
+
+	/**
+	 * Cap in milliseconds for exponential backoff on repeated non-conflict
+	 * errors. Defaults to 30000. Only applies when errorDelayMs > 0.
+	 */
+	maxErrorBackoffMs?: number;
 }
 
 /**
@@ -71,6 +84,12 @@ export class TelegramPoller {
 	private readonly onError: ((err: unknown) => void) | undefined;
 	private readonly errorDelayMs: number;
 	private readonly conflictDelayMs: number;
+	private readonly maxErrorBackoffMs: number;
+	/**
+	 * Consecutive non-conflict error count for exponential backoff.
+	 * Reset to 0 on the first successful getUpdates response.
+	 */
+	private consecutiveErrors = 0;
 
 	constructor(deps: PollerDeps) {
 		this.transport = deps.transport;
@@ -81,6 +100,7 @@ export class TelegramPoller {
 		this.onError = deps.onError;
 		this.errorDelayMs = deps.errorDelayMs ?? 0;
 		this.conflictDelayMs = deps.conflictDelayMs ?? 3000;
+		this.maxErrorBackoffMs = deps.maxErrorBackoffMs ?? 30_000;
 	}
 
 	/**
@@ -88,6 +108,7 @@ export class TelegramPoller {
 	 * Runs until the signal is aborted.
 	 */
 	async start(signal: AbortSignal): Promise<void> {
+		log.info("poller.start", { pollTimeout: this.pollTimeoutSeconds });
 		while (!signal.aborted) {
 			try {
 				const offset = this.getCursor() + 1;
@@ -98,6 +119,12 @@ export class TelegramPoller {
 					},
 					signal,
 				);
+
+				// Success — reset the backoff counter.
+				if (this.consecutiveErrors > 0) {
+					log.info("poller.recovered", { after: this.consecutiveErrors });
+				}
+				this.consecutiveErrors = 0;
 
 				// Process each update in order
 				for (const update of updates) {
@@ -139,16 +166,44 @@ export class TelegramPoller {
 					}
 				}
 
-				// A 409 conflict means another poller holds this bot's getUpdates
-				// (e.g. a previous session winding down after /new). Back off
-				// longer so it can terminate, instead of racing it. Other errors
-				// use the normal short delay.
-				const delay = this.isConflictError(err) ? this.conflictDelayMs : this.errorDelayMs;
+				const isConflict = this.isConflictError(err);
+				const retryAfter = getRetryAfterSeconds(err);
+				this.consecutiveErrors += 1;
+
+				// Compute the delay for this attempt.
+				let delay: number;
+				if (isConflict) {
+					// A 409 conflict means another poller holds this bot's
+					// getUpdates (e.g. a previous session winding down after
+					// /new). Back off longer so it can terminate.
+					delay = this.conflictDelayMs;
+				} else {
+					// Exponential backoff: base * 2^(errors-1), capped.
+					delay = this.errorDelayMs * 2 ** (this.consecutiveErrors - 1);
+					if (delay > this.maxErrorBackoffMs) delay = this.maxErrorBackoffMs;
+				}
+
+				// A 429 rate-limit carries an authoritative retry_after.
+				// Always honor it: Telegram will reject anything sooner.
+				if (retryAfter !== undefined) {
+					const retryMs = retryAfter * 1000;
+					if (retryMs > delay) delay = retryMs;
+				}
+
+				log.warn("poller.error", {
+					error: err instanceof Error ? err.message : String(err),
+					isConflict,
+					retryAfter,
+					consecutive: this.consecutiveErrors,
+					delayMs: delay,
+				});
+
 				if (delay > 0) {
-					await this.sleep(delay);
+					await this.sleep(delay, signal);
 				}
 			}
 		}
+		log.debug("poller.exit");
 	}
 
 	/**
@@ -164,8 +219,21 @@ export class TelegramPoller {
 
 	/**
 	 * Sleep for the specified number of milliseconds.
+	 * Resolves immediately if the signal aborts mid-sleep, so /pigram-disconnect
+	 * does not block waiting for a long backoff to finish.
 	 */
-	private sleep(ms: number): Promise<void> {
-		return new Promise((resolve) => setTimeout(resolve, ms));
+	private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+		if (signal?.aborted) return Promise.resolve();
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				signal?.removeEventListener("abort", onAbort);
+				resolve();
+			}, ms);
+			const onAbort = () => {
+				clearTimeout(timer);
+				resolve();
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+		});
 	}
 }
