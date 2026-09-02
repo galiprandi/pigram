@@ -7,7 +7,8 @@
  *
  * @see docs/adr/0004-poller-lock.md
  */
-import { writeFile, readFile, unlink } from "node:fs/promises";
+import { writeFile, readFile, unlink, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 
 /** Shape of the lock file on disk. */
 export interface LockInfo {
@@ -59,6 +60,8 @@ export async function tryAcquireLock(
     startedAt: now,
     heartbeat: now,
   };
+
+  await mkdir(dirname(lockPath), { recursive: true });
 
   try {
     await writeFile(lockPath, JSON.stringify(payload), { flag: "wx" });
