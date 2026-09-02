@@ -1,8 +1,8 @@
 # Dependencies
 node_modules/
 
-# Build output
-dist/
+# Build output (dist/ is committed so pi install git: works without a build step)
+# dist/
 
 # Logs
 *.log

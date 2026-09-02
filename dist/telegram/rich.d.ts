@@ -1,0 +1,37 @@
+/**
+ * Bot API 10.1 Rich Message support for markdown tables.
+ *
+ * Telegram's HTML parse mode has no <table> primitive, so pigram renders
+ * tables as a fixed-width <pre> grid. That works but is static: no borders,
+ * no horizontal scroll on narrow phones. Bot API 10.1 added sendRichMessage,
+ * which accepts raw markdown and renders GFM pipe tables as NATIVE bordered
+ * tables the client can scroll horizontally.
+ *
+ * This module is deliberately small: it answers two questions.
+ *
+ *  1. does this reply contain a GFM table? (should we attempt rich at all)
+ *  2. did rich delivery fail for a PERMANENT reason? (stop trying this session)
+ *
+ * Everything else — sending, editing, fallback to HTML — stays in preview.ts
+ * and index.ts so the failure paths remain exactly where they are today.
+ */
+/**
+ * True when the markdown contains a complete GFM pipe table: a header row
+ * followed by a delimiter row. Fenced code blocks are skipped — a table
+ * inside ``` fences is example text, not a table to render natively.
+ */
+export declare function containsGfmTable(markdown: string): boolean;
+/**
+ * Split a GFM row into trimmed cell values.
+ * Exported for tests and future reuse.
+ */
+export declare function splitTableRow(row: string): string[];
+/**
+ * True when a rich-send error is permanent: retrying sendRichMessage with
+ * different content of the same shape will fail again. Capability errors
+ * (method not deployed / old server) and BadRequest (content rejected by
+ * the rich parser) both qualify — the caller falls back to the HTML path.
+ * Transient failures (network, 5xx, rate limit) do NOT qualify: the message
+ * may have reached Telegram, so legacy-resending risks a duplicate bubble.
+ */
+export declare function isPermanentRichError(error: unknown): boolean;
